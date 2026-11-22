@@ -244,8 +244,9 @@ def test_failure_rolls_back_everything(tmp_path, monkeypatch):
     )
     with pytest.raises(RuntimeError):
         logic.submit_batch(db, "B1", triple("O"))
-    # 批次、观测、名录、证据全部不留痕
-    for table in ("batches", "observations", "registry", "evidence", "evidence_obs"):
+    # 批次、观测、名录、证据、统计摘要全部不留痕
+    for table in ("batches", "observations", "registry", "evidence", "evidence_obs",
+                  "summary_plot_species"):
         assert db.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"] == 0
     db.close()
 
@@ -276,4 +277,10 @@ def test_concurrent_submissions_stay_consistent(tmp_path):
         "SELECT COUNT(*) AS n FROM evidence WHERE status = 'valid'"
     ).fetchone()["n"]
     assert ev == 1  # 只有一个有效证据，其余组合复核均为 kept
+    # 统计摘要：3 个 (样地, 鸟种) 组合，各被 12 个有效批次引用，并发计数不丢
+    summary = db.conn.execute(
+        "SELECT plot, species, batch_count FROM summary_plot_species"
+    ).fetchall()
+    assert len(summary) == 3
+    assert all(r["batch_count"] == 12 for r in summary)
     db.close()

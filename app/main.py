@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import logic, models, seed
@@ -22,6 +22,10 @@ DESCRIPTION = """\
 * **GET /registry** 当前名录（县、鸟种、证据号）。
 * **GET /evidence/{evidence_no}** 按证据号追溯原三笔的批号、观测号及证据有效性；
   已失效的旧证据号仍可查询。
+* **GET /compare?county=甲县&county=乙县** 2～8 个县按共同抽样量比对鸟种丰富度：
+  只取有效批次，同县同样地同种只算一次（未入册鸟种也计入），
+  以各县有效样地数的最小值为共同抽样量，返回各县等概率、不放回抽样时
+  不同鸟种数的期望；有县缺少有效样地时返回 422 并列出缺数的县。
 """
 
 
@@ -57,6 +61,15 @@ def create_app() -> FastAPI:
     @app.exception_handler(logic.ValidationError)
     async def validation_handler(_: Request, exc: logic.ValidationError) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(logic.InsufficientDataError)
+    async def insufficient_handler(
+        _: Request, exc: logic.InsufficientDataError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "missing_counties": exc.missing},
+        )
 
     # ------------------------------------------------------------ 写接口
 
@@ -116,6 +129,25 @@ def create_app() -> FastAPI:
     )
     def get_batch(batch_no: str) -> dict:
         return logic.get_batch(db, batch_no)
+
+    @app.get(
+        "/compare",
+        response_model=models.CompareResponse,
+        summary="多县鸟种丰富度比对（共同抽样量下的期望种数）",
+    )
+    def compare(
+        counties: list[models.CountyName] = Query(
+            alias="county",
+            description="参与比对的县名（2～8 个、互不相同，"
+            "需与上报时的县名完全一致），重复传入该参数",
+        ),
+    ) -> dict:
+        """按共同抽样量比对：返回共同抽样量、各县有效样地数与期望鸟种数。
+
+        只统计有效批次；同县同样地同种的重复观测只算一次，未入册鸟种也计入。
+        有县缺少有效样地时返回 422 并在 missing_counties 中列出缺数的县。
+        """
+        return logic.compare_counties(db, counties)
 
     return app
 

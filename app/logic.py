@@ -25,6 +25,14 @@ class ValidationError(Exception):
     """领域校验失败（如批内观测号重复）。"""
 
 
+class InsufficientDataError(Exception):
+    """比对所需的有效样地不足：部分县没有任何有效样地。"""
+
+    def __init__(self, missing: list[str]):
+        self.missing = list(missing)
+        super().__init__(f"以下县缺少有效样地，本次比对停止：{', '.join(self.missing)}")
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -44,6 +52,41 @@ def payload_hash(batch_no: str, observations: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------- 内部工具
+
+
+def _apply_batch_to_summary(conn: sqlite3.Connection, batch_no: str, sign: int) -> None:
+    """把一批观测对统计摘要的贡献计入（sign=+1）或剔除（sign=-1）。
+
+    只读取该批的观测明细；同批内同一 (县, 样地, 鸟种) 去重后只计一次；
+    只更新受影响的 (县, 样地, 鸟种) 统计行。在调用方的事务内执行，
+    与批次状态同生共死。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT county, plot, species FROM observations WHERE batch_no = ?",
+        (batch_no,),
+    ).fetchall()
+    keys = [(r["county"], r["plot"], r["species"]) for r in rows]
+    if sign > 0:
+        conn.executemany(
+            "INSERT INTO summary_plot_species (county, plot, species, batch_count)"
+            " VALUES (?, ?, ?, 1)"
+            " ON CONFLICT (county, plot, species)"
+            " DO UPDATE SET batch_count = batch_count + 1",
+            keys,
+        )
+    else:
+        # 先删计数为 1 的行（该批是其最后一个有效批次），再减其余行的计数，
+        # 全程满足 batch_count > 0 约束，且只触碰受影响的行。
+        conn.executemany(
+            "DELETE FROM summary_plot_species"
+            " WHERE county = ? AND plot = ? AND species = ? AND batch_count = 1",
+            keys,
+        )
+        conn.executemany(
+            "UPDATE summary_plot_species SET batch_count = batch_count - 1"
+            " WHERE county = ? AND plot = ? AND species = ?",
+            keys,
+        )
 
 
 def _next_evidence_no(conn: sqlite3.Connection) -> str:
@@ -212,6 +255,7 @@ def submit_batch(
                     for o in observations
                 ],
             )
+            _apply_batch_to_summary(conn, batch_no, +1)
             combos = sorted({(o["county"], o["species"]) for o in observations})
             changes: list[dict[str, Any]] = []
             for county, species in combos:
@@ -255,6 +299,7 @@ def withdraw_batch(db: Database, batch_no: str) -> dict[str, Any]:
                 "UPDATE batches SET status = 'withdrawn', withdrawn_at = ? WHERE batch_no = ?",
                 (utcnow(), batch_no),
             )
+            _apply_batch_to_summary(conn, batch_no, -1)
             combos = conn.execute(
                 "SELECT DISTINCT county, species FROM observations WHERE batch_no = ?"
                 " ORDER BY county, species",
@@ -348,3 +393,83 @@ def list_batches(db: Database) -> list[dict[str, Any]]:
         """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- 丰富度比对
+
+
+def _absent_prob(n_total: int, n_present: int, draw: int) -> float:
+    """等概率不放回从 n_total 个样地抽 draw 个时，某物种一次都未出现的概率。
+
+    该物种出现在其中 n_present 个样地，未出现概率为
+    C(n_total - n_present, draw) / C(n_total, draw)，用连乘形式计算，
+    避免大组合数溢出。
+    """
+    if draw <= 0:
+        return 1.0
+    absent = n_total - n_present
+    if absent < draw:
+        return 0.0
+    prob = 1.0
+    for k in range(draw):
+        prob *= (absent - k) / (n_total - k)
+    return prob
+
+
+def compare_counties(db: Database, counties: list[str]) -> dict[str, Any]:
+    """按共同抽样量比对各县鸟种丰富度（稀有化期望）。
+
+    只取有效批次的统计摘要：同县同样地同种只算一次，未入册鸟种也计入。
+    共同抽样量 = 各县有效样地数的最小值；对每县返回等概率、不放回
+    抽取该数量样地时不同鸟种数的期望。任一县没有有效样地则停止比对。
+    """
+    if not 2 <= len(counties) <= 8:
+        raise ValidationError("县名数量须在 2～8 个之间")
+    if len(set(counties)) != len(counties):
+        raise ValidationError("县名重复，请去重后再比对")
+
+    # 写锁保证读到的是同一已提交状态的摘要：写事务全程持锁，
+    # 这里两次查询之间不会插入任何提交。
+    with db.lock:
+        placeholders = ", ".join("?" for _ in counties)
+        plot_rows = db.conn.execute(
+            "SELECT county, COUNT(DISTINCT plot) AS plots"
+            f" FROM summary_plot_species WHERE county IN ({placeholders})"
+            " GROUP BY county",
+            counties,
+        ).fetchall()
+        plots_by_county = {r["county"]: r["plots"] for r in plot_rows}
+        missing = [c for c in counties if plots_by_county.get(c, 0) == 0]
+        if missing:
+            raise InsufficientDataError(missing)
+        species_rows = db.conn.execute(
+            "SELECT county, species, COUNT(DISTINCT plot) AS n"
+            f" FROM summary_plot_species WHERE county IN ({placeholders})"
+            " GROUP BY county, species",
+            counties,
+        ).fetchall()
+
+    plot_counts_by_species: dict[str, list[int]] = {c: [] for c in counties}
+    for r in species_rows:
+        plot_counts_by_species[r["county"]].append(r["n"])
+
+    common = min(plots_by_county[c] for c in counties)
+    results = []
+    for county in counties:
+        n_total = plots_by_county[county]
+        expected = sum(
+            1.0 - _absent_prob(n_total, n_present, common)
+            for n_present in plot_counts_by_species[county]
+        )
+        results.append(
+            {
+                "county": county,
+                "valid_plots": n_total,
+                "expected_species": round(expected, 6),
+            }
+        )
+    return {
+        "counties": list(counties),
+        "common_sample_size": common,
+        "results": results,
+    }

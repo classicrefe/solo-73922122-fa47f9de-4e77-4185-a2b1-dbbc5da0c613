@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+CountyName = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)
+]
 
 
 class ObservationIn(BaseModel):
@@ -98,3 +102,19 @@ class EvidenceDetail(BaseModel):
     created_at: str
     observations: list[EvidenceObservation]
     all_source_batches_active: bool
+
+
+class CountyComparison(BaseModel):
+    county: str = Field(description="县名")
+    valid_plots: int = Field(description="该县有效样地数（有效批次去重后的样地集合）")
+    expected_species: float = Field(
+        description="按共同抽样量等概率不放回抽样时，不同鸟种数的期望"
+    )
+
+
+class CompareResponse(BaseModel):
+    counties: list[str] = Field(description="参与比对的县（按请求顺序）")
+    common_sample_size: int = Field(
+        description="共同抽样量：各县有效样地数的最小值"
+    )
+    results: list[CountyComparison]
