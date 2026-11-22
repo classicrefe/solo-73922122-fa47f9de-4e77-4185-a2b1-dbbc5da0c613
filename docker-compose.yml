@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DEMO_SEED: "1"          # 首次启动写入演示批次，便于在 /docs 演示取数与撤批
+      DB_PATH: /data/registry.db
+    volumes:
+      - registry-data:/data
+    restart: unless-stopped
+
+volumes:
+  registry-data:
